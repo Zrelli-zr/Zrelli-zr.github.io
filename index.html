@@ -2288,6 +2288,12 @@
   // world-readable but insert/update/delete-restricted to owner_id = auth.uid().
   const SHARED_TABLE = 'shared_exercises';
   function extFromStoragePath(path){ const m = /\.([a-z0-9]+)$/i.exec(path||''); return m ? m[1] : 'bin'; }
+  // Smart Review's own normalized SQL table (one row per user+story+sentence) — see
+  // smart_review_schema.sql. This sits alongside the existing whole-snapshot `user_data` sync
+  // (gatherLocalSnapshot/pushSnapshotNow below), which already carries review data as part of
+  // each exercise record; this table exists so a single sentence's review record can be
+  // written/read directly, indexed by nextReviewAt, without touching the rest of that user's data.
+  const SMART_REVIEW_TABLE = 'smart_review_sentences';
 
   // Publishes (or re-publishes) one exercise. Audio is copied server-side from wherever it already
   // lives (this record's own private path, or — if this is itself a locally-added copy of someone
@@ -2421,31 +2427,115 @@
     clearTimeout(cloudSyncTimer);
     cloudSyncTimer = setTimeout(()=>{ pushSnapshotNow().catch(err=> console.error('Cloud push failed', err)); }, 0);
   }
+  // The actual network write for a snapshot, split out of pushSnapshotNow so both the live save path
+  // and the queued-retry path (processSyncQueue below) share one implementation. Behavior is exactly
+  // what pushSnapshotNow used to do inline — unchanged upsert logic, just given a name.
+  async function writeSnapshotToSql(snap){
+    const userId = supabaseSession.user.id;
+    if(cloudRowId){
+      const { error } = await supabaseClient.from('user_data').update({ data: snap }).eq('id', cloudRowId);
+      if(error) throw error;
+    } else {
+      const { data, error } = await supabaseClient.from('user_data')
+        .select('id').eq('user_id', userId).maybeSingle();
+      if(error) throw error;
+      if(data){
+        cloudRowId = data.id;
+        const { error: updErr } = await supabaseClient.from('user_data').update({ data: snap }).eq('id', cloudRowId);
+        if(updErr) throw updErr;
+      } else {
+        const ins = await supabaseClient.from('user_data')
+          .insert({ user_id: userId, data: snap }).select('id').single();
+        if(ins.error) throw ins.error;
+        if(ins.data) cloudRowId = ins.data.id;
+      }
+    }
+  }
   async function pushSnapshotNow(){
     if(!supabaseSession || cloudSyncInFlight) return;
     cloudSyncInFlight = true;
+    let snap;
     try{
-      const snap = await gatherLocalSnapshot();
-      const userId = supabaseSession.user.id;
-      if(cloudRowId){
-        const { error } = await supabaseClient.from('user_data').update({ data: snap }).eq('id', cloudRowId);
-        if(error) throw error;
-      } else {
-        const { data, error } = await supabaseClient.from('user_data')
-          .select('id').eq('user_id', userId).maybeSingle();
-        if(error) throw error;
-        if(data){
-          cloudRowId = data.id;
-          const { error: updErr } = await supabaseClient.from('user_data').update({ data: snap }).eq('id', cloudRowId);
-          if(updErr) throw updErr;
-        } else {
-          const ins = await supabaseClient.from('user_data')
-            .insert({ user_id: userId, data: snap }).select('id').single();
-          if(ins.error) throw ins.error;
-          if(ins.data) cloudRowId = ins.data.id;
+      snap = await gatherLocalSnapshot();
+      await writeSnapshotToSql(snap);
+      await dequeueSyncItem('snapshot'); // in case an older attempt was sitting in the retry queue
+    } catch(err){
+      console.error('Cloud push failed, queued for retry', err);
+      // RELIABILITY: previously this error just vanished into scheduleCloudPush's .catch(console.error)
+      // and nothing tried again until the next unrelated dbPut happened to fire scheduleCloudPush.
+      // Now the snapshot that failed to save is captured and handed to the retry queue.
+      if(snap) await enqueueSyncItem('snapshot', 'snapshot', snap);
+    } finally { cloudSyncInFlight = false; }
+    processSyncQueue(); // best-effort, non-blocking: drain any other pending retries too
+  }
+
+  /* ================= RELIABILITY: Supabase write retry queue =================
+     Every push function below (user_data snapshot, profile_progress, story_progress,
+     smart_review_sentences) used to be pure fire-and-forget: on failure it logged to console and
+     nothing ever tried again until the next unrelated save happened to touch the same target. That
+     left real gaps — e.g. a laptop closed mid-flight, or a phone going offline mid-session — with no
+     recovery at all.
+     This section adds a small durable queue (SYNC_QUEUE_STORE, IndexedDB) that every push function
+     falls back to on failure. It does not change what gets synced, which Supabase tables/columns are
+     used, or any gamification/spaced-repetition math — it only makes sure a write that failed
+     eventually gets retried instead of silently disappearing.
+     Queue entries are keyed so a fresher local change always replaces a still-pending older one for
+     the same target (e.g. re-queuing 'profileProgress' overwrites the previous queued profileProgress
+     write) rather than piling up duplicate stale writes. */
+  const SYNC_RETRY_BASE_MS = 30000;      // first retry ~30s after a failure
+  const SYNC_RETRY_MAX_MS = 10*60*1000;  // back off up to a 10-minute ceiling
+  let syncQueueInFlight = false;
+  async function enqueueSyncItem(key, type, payload){
+    try{
+      await dbPutQuiet({
+        key, type, payload,
+        attempts: 0,                    // a fresh payload gets a fresh attempt count/backoff —
+        nextAttemptAt: Date.now(),       // no reason to make newer data wait out an older failure's delay
+        lastError: null, queuedAt: Date.now()
+      }, SYNC_QUEUE_STORE);
+    }catch(err){ console.error('Failed to record retry (will be attempted again on the next save)', err); }
+  }
+  async function dequeueSyncItem(key){
+    try{ await dbDeleteQuiet(key, SYNC_QUEUE_STORE); }catch(err){ /* non-fatal: worst case it's retried once more and then removed */ }
+  }
+  // Performs the write for one queued item, reusing the exact same network-write functions the live
+  // save paths use (writeSnapshotToSql / writeProfileProgressToSql / writeStoryProgressToSql /
+  // writeSmartReviewRowToSql) — no separate/duplicate write logic to drift out of sync.
+  async function attemptQueuedItem(item){
+    switch(item.type){
+      case 'snapshot': return writeSnapshotToSql(item.payload);
+      case 'profileProgress': return writeProfileProgressToSql(item.payload);
+      case 'storyProgress': return writeStoryProgressToSql(item.payload);
+      case 'smartReview': return writeSmartReviewRowToSql(item.payload);
+      default: return Promise.resolve(); // unknown item type: drop it rather than retry forever
+    }
+  }
+  // Walks every queued retry that's due and attempts it. Safe to call opportunistically/often — it's
+  // a no-op when signed out, already running, or nothing is due yet. Each item is retried
+  // independently so one still-failing item never blocks others from draining.
+  async function processSyncQueue(){
+    if(!supabaseSession || syncQueueInFlight) return;
+    syncQueueInFlight = true;
+    try{
+      let items;
+      try{ items = await dbGetAll(SYNC_QUEUE_STORE); }catch(err){ console.error('Could not read sync retry queue', err); return; }
+      const now = Date.now();
+      for(const item of items){
+        if((item.nextAttemptAt||0) > now) continue;
+        try{
+          await attemptQueuedItem(item);
+          await dequeueSyncItem(item.key);
+        }catch(err){
+          const attempts = (item.attempts||0) + 1;
+          const delay = Math.min(SYNC_RETRY_BASE_MS * Math.pow(2, attempts-1), SYNC_RETRY_MAX_MS);
+          try{
+            await dbPutQuiet(Object.assign({}, item, {
+              attempts, nextAttemptAt: Date.now()+delay, lastError: (err&&err.message)||'unknown error'
+            }), SYNC_QUEUE_STORE);
+          }catch(persistErr){ console.error('Could not persist retry backoff for', item.key, persistErr); }
         }
       }
-    } finally { cloudSyncInFlight = false; }
+    } finally { syncQueueInFlight = false; }
   }
   // FIX: previously conflated "no cloud row yet" (normal for a first-ever login) with "the query actually
   // failed" (RLS permission denied, network error) by returning null for both — so onAuthReady's caller
@@ -2459,6 +2549,224 @@
     if(!data) return null;
     cloudRowId = data.id;
     return data.data;
+  }
+
+  /* ================= Smart Review: normalized SQL persistence ================= */
+  // Converts the app's existing in-memory review object (see emptyReview()/buildSentenceReviewUpdate())
+  // into a smart_review_sentences row. Field-for-field mirror — no new Smart Review data invented here.
+  function smartReviewRowFromReview(userId, storyId, sentenceIndex, sentenceId, review){
+    return {
+      user_id: userId, story_id: storyId, sentence_index: sentenceIndex, sentence_id: sentenceId || null,
+      attempts: review.attempts || 0,
+      first_check_accuracy: review.firstCheckAccuracy,
+      best_accuracy: review.bestAccuracy,
+      average_accuracy: review.averageAccuracy,
+      mistakes: review.mistakes || 0,
+      replay_count: review.replayCount || 0,
+      retry_count: review.retryCount || 0,
+      total_typing_time_ms: review.totalTypingTimeMs || 0,
+      difficulty: review.difficulty || null,
+      mastery_level: review.masteryLevel || null,
+      consecutive_good: review.consecutiveGood || 0,
+      accuracy_history: review.accuracyHistory || [],
+      trend: review.trend || null,
+      retention_score: review.retentionScore || 0,
+      review_count: review.reviewCount || 0,
+      last_reviewed_at: review.lastReviewedAt,
+      next_review_at: review.nextReviewAt
+    };
+  }
+  // The reverse mapping, used when restoring from SQL on load.
+  function reviewFromSmartReviewRow(row){
+    return {
+      attempts: row.attempts || 0,
+      firstCheckAccuracy: row.first_check_accuracy,
+      bestAccuracy: row.best_accuracy,
+      averageAccuracy: row.average_accuracy,
+      mistakes: row.mistakes || 0,
+      replayCount: row.replay_count || 0,
+      retryCount: row.retry_count || 0,
+      totalTypingTimeMs: row.total_typing_time_ms || 0,
+      difficulty: row.difficulty,
+      lastReviewedAt: row.last_reviewed_at,
+      nextReviewAt: row.next_review_at,
+      reviewCount: row.review_count || 0,
+      consecutiveGood: row.consecutive_good || 0,
+      accuracyHistory: row.accuracy_history || [],
+      trend: row.trend,
+      masteryLevel: row.mastery_level,
+      retentionScore: row.retention_score || 0
+    };
+  }
+  // Pure network write, no fallback logic — shared by the live save path below and the queued-retry
+  // path (attemptQueuedItem). onConflict targets the same unique key the schema defines, so this can
+  // never duplicate a sentence's row — repeated calls for the same user+story+sentence always update.
+  async function writeSmartReviewRowsToSql(rows){
+    const { error } = await supabaseClient.from(SMART_REVIEW_TABLE)
+      .upsert(rows, { onConflict: 'user_id,story_id,sentence_index' });
+    if(error) throw error;
+  }
+  async function writeSmartReviewRowToSql(row){ return writeSmartReviewRowsToSql([row]); }
+  // Upserts one or more sentences' review records to SQL. IndexedDB (dbPut) already holds the
+  // authoritative copy, so this never throws back into the caller — the existing review session must
+  // never crash or stall because this failed (spec section 4). RELIABILITY: a failed write is no
+  // longer just logged and dropped — each row is queued for retry individually (keyed by
+  // user+story+sentence, matching the table's real unique key) so a fresher write for the same
+  // sentence simply replaces the still-pending older one instead of piling up duplicates.
+  async function pushSmartReviewRowsToSql(entries){
+    if(!supabaseSession || !entries || !entries.length) return;
+    const userId = supabaseSession.user.id;
+    const rows = entries.map(e=> smartReviewRowFromReview(userId, e.storyId, e.sentenceIndex, e.sentenceId, e.review));
+    try{
+      await writeSmartReviewRowsToSql(rows);
+      await Promise.all(rows.map(row=> dequeueSyncItem('smartReview:'+userId+':'+row.story_id+':'+row.sentence_index)));
+    }catch(err){
+      console.error('Smart Review: SQL save failed, queued for retry (kept locally in IndexedDB)', err);
+      await Promise.all(rows.map(row=>
+        enqueueSyncItem('smartReview:'+userId+':'+row.story_id+':'+row.sentence_index, 'smartReview', row)
+      ));
+      processSyncQueue();
+    }
+  }
+  async function pushSmartReviewRowToSql(storyId, sentenceIndex, sentenceId, review){
+    return pushSmartReviewRowsToSql([{ storyId, sentenceIndex, sentenceId, review }]);
+  }
+  // Pulls every Smart Review row this signed-in user owns.
+  async function pullSmartReviewRowsFromSql(){
+    if(!supabaseSession) return [];
+    const userId = supabaseSession.user.id;
+    const { data, error } = await supabaseClient.from(SMART_REVIEW_TABLE).select('*').eq('user_id', userId);
+    if(error) throw error;
+    return data || [];
+  }
+  // Restores SQL rows into the matching local exercise records' sentences[].review, addressed the
+  // same way commitReviewSentenceUpdate writes them (story_id -> record id, sentence_index ->
+  // position in rec.sentences). Only overwrites a sentence's local review when the SQL copy is
+  // actually newer (by lastReviewedAt) — this is a merge, not a wholesale overwrite, so a device
+  // that already has fresher local progress than what's in SQL never loses it.
+  async function applySmartReviewRowsToLocal(rows){
+    if(!rows || !rows.length) return;
+    const byStory = new Map();
+    rows.forEach(row=>{
+      if(!byStory.has(row.story_id)) byStory.set(row.story_id, []);
+      byStory.get(row.story_id).push(row);
+    });
+    for(const [storyId, storyRows] of byStory){
+      try{
+        const rec = await dbGet(storyId);
+        if(!rec || !rec.sentences) continue;
+        let changed = false;
+        storyRows.forEach(row=>{
+          const s = rec.sentences[row.sentence_index];
+          if(!s) return;
+          const localTs = (s.review && s.review.lastReviewedAt) || 0;
+          const remoteTs = row.last_reviewed_at || 0;
+          if(!s.review || remoteTs > localTs){
+            s.review = reviewFromSmartReviewRow(row);
+            changed = true;
+          }
+        });
+        if(changed){ rec.updatedAt = Date.now(); await dbPut(rec); }
+      }catch(err){ console.error('Smart Review: failed to apply cloud row for story', storyId, err); }
+    }
+  }
+
+  /* ================= Story/profile progression: normalized SQL mirror =================
+     gatherLocalSnapshot/pushSnapshotNow already persist every field of `exercises` and `profile`
+     to SQL (as the `data` JSON blob on user_data — see spec section 1's existing coverage), and
+     that blob remains the authoritative source used to restore app state on login. The two tables
+     below add queryable, structured columns for the specific fields the spec calls out (story
+     completion, CEFR level, words correct, accuracy, streak, etc.) alongside it — same
+     best-effort/non-blocking/upsert pattern as Smart Review above, so this can never stall or
+     break a save if SQL is briefly unavailable. Nothing here is read back to reconstruct UI state;
+     IndexedDB + the existing blob already do that, unchanged. */
+  const STORY_PROGRESS_TABLE = 'story_progress';
+  const PROFILE_PROGRESS_TABLE = 'profile_progress';
+
+  // Field-for-field derived from the existing exercise record shape written by persistNow() —
+  // no new progression fields invented here, just read out of what's already there.
+  function storyProgressRowFromRecord(userId, rec){
+    const sentencesTotal = (rec.sentences||[]).length;
+    const statuses = (rec.progress && rec.progress.statuses) || [];
+    const sentencesCompleted = statuses.filter(s=> s && s!=='pending').length;
+    const wordStats = (rec.progress && rec.progress.wordStats) || [];
+    let wordsCorrect=0, wordsTotal=0;
+    wordStats.forEach(ws=>{ if(ws){ wordsCorrect += ws.correct||0; wordsTotal += ws.total||0; } });
+    const finished = !!(rec.progress && rec.progress.finished);
+    return {
+      user_id: userId,
+      story_id: rec.id,
+      title: rec.title || null,
+      cefr_level: rec.level || null,
+      status: finished ? 'completed' : (sentencesCompleted>0 ? 'in_progress' : 'not_started'),
+      sentences_total: sentencesTotal,
+      sentences_completed: sentencesCompleted,
+      words_correct: wordsCorrect,
+      words_total: wordsTotal,
+      accuracy: wordsTotal>0 ? Math.round((wordsCorrect/wordsTotal)*1000)/10 : null,
+      attempts_count: (rec.attempts||[]).length,
+      last_practiced_at: rec.updatedAt ? new Date(rec.updatedAt).toISOString() : null,
+      // Sent only while finished; a DB trigger (see migration) keeps this from ever being cleared
+      // back to null by a later non-finished save of the same story, so it still reflects the
+      // first completion even though this client never reads the row back to check.
+      completed_at: finished ? new Date(rec.updatedAt||Date.now()).toISOString() : null
+    };
+  }
+  // Pure network write — shared by the live save path below and the queued-retry path.
+  async function writeStoryProgressToSql(row){
+    const { error } = await supabaseClient.from(STORY_PROGRESS_TABLE).upsert(row, { onConflict:'user_id,story_id' });
+    if(error) throw error;
+  }
+  // Mirror of one story's progress into SQL. Never awaited by callers, never throws into the save
+  // flow — see persistNow(). IndexedDB already holds the authoritative record. RELIABILITY: a failed
+  // write is queued for retry (keyed by user+story, so a fresher save of the same story simply
+  // replaces the still-pending older one) instead of being dropped after one console.error.
+  async function pushStoryProgressToSql(rec){
+    if(!supabaseSession || !rec || !rec.id) return;
+    const userId = supabaseSession.user.id;
+    const row = storyProgressRowFromRecord(userId, rec);
+    try{
+      await writeStoryProgressToSql(row);
+      await dequeueSyncItem('storyProgress:'+userId+':'+rec.id);
+    }catch(err){
+      console.error('Story progress: SQL save failed, queued for retry (kept locally in IndexedDB)', err);
+      await enqueueSyncItem('storyProgress:'+userId+':'+rec.id, 'storyProgress', row);
+      processSyncQueue();
+    }
+  }
+
+  function profileProgressRowFromProfile(userId, profile){
+    const masteryThreshold = (_configCache && _configCache.masteryThreshold) || 5;
+    return {
+      user_id: userId,
+      xp_total: profile.xpTotal || 0,
+      level: profile.level || 1,
+      streak_current: (profile.streak && profile.streak.current) || 0,
+      streak_longest: (profile.streak && profile.streak.longest) || 0,
+      last_practice_date: (profile.streak && profile.streak.lastPracticeDate) || null,
+      words_mastered: countMasteredWords(profile.wordStats||{}, masteryThreshold)
+    };
+  }
+  // Pure network write — shared by the live save path below and the queued-retry path.
+  async function writeProfileProgressToSql(row){
+    const { error } = await supabaseClient.from(PROFILE_PROGRESS_TABLE).upsert(row, { onConflict:'user_id' });
+    if(error) throw error;
+  }
+  // Mirror of the profile's streak/XP/mastery summary into SQL — see saveProfile(). RELIABILITY: a
+  // failed write is queued for retry (keyed per user, so a fresher save simply replaces the
+  // still-pending older one) instead of being dropped after one console.error.
+  async function pushProfileProgressToSql(profile){
+    if(!supabaseSession || !profile) return;
+    const userId = supabaseSession.user.id;
+    const row = profileProgressRowFromProfile(userId, profile);
+    try{
+      await writeProfileProgressToSql(row);
+      await dequeueSyncItem('profileProgress:'+userId);
+    }catch(err){
+      console.error('Profile progress: SQL save failed, queued for retry (kept locally in IndexedDB)', err);
+      await enqueueSyncItem('profileProgress:'+userId, 'profileProgress', row);
+      processSyncQueue();
+    }
   }
 
   let supabaseSession = null;
@@ -2604,14 +2912,40 @@
         syncErrEl.style.display = 'block';
       }
     }
+    // Smart Review: restore this account's per-sentence review rows from SQL on top of whatever
+    // the whole-snapshot merge above just settled on (spec section 3). Kept in its own try/catch —
+    // separate from the block above — so a problem here never surfaces the user_data/RLS error
+    // banner or blocks sign-in; IndexedDB's own copy of review data still works either way.
+    try{
+      const rows = await pullSmartReviewRowsFromSql();
+      await applySmartReviewRowsToLocal(rows);
+    }catch(err){ console.error('Smart Review: cloud load failed', err); }
+    // Backfill the normalized story/profile progress tables from whatever local state just won the
+    // merge above — covers both a brand-new device (nothing in these tables yet) and an existing
+    // account whose local data was newer than the cloud blob. Fire-and-forget, one pass at login
+    // only (not on every save), each row independently best-effort — see the push functions.
+    try{
+      const [exercises, profile] = await Promise.all([dbGetAll(STORE), dbGet(PROFILE_ID, PROFILE_STORE)]);
+      exercises.forEach(rec=> pushStoryProgressToSql(rec));
+      if(profile) pushProfileProgressToSql(profile);
+    }catch(err){ console.error('Progress backfill failed', err); }
+    // RELIABILITY: drain anything left over from a previous session (e.g. the tab/laptop closed
+    // mid-retry last time) — the queue persists in IndexedDB across reloads, so this is the recovery
+    // point for failures that happened before the app was even reopened.
+    processSyncQueue();
     goToScreen('home');
     updateLibScopeUI();
     renderHomeScreen();
   }
 
   /* ================= IndexedDB layer ================= */
-  const DB_NAME='dictationDeckDB', DB_VERSION=2, STORE='exercises', PROFILE_STORE='profile', CONFIG_STORE='config';
+  const DB_NAME='dictationDeckDB', DB_VERSION=3, STORE='exercises', PROFILE_STORE='profile', CONFIG_STORE='config';
   const PROFILE_ID='profile', CONFIG_ID='config';
+  // RELIABILITY: durable retry queue for Supabase writes. Nothing about the app's own data shape
+  // changes — this store only holds "a write to Supabase failed, try again later" bookkeeping, keyed
+  // so a fresher local change always supersedes a still-pending older one instead of piling up. Bumping
+  // DB_VERSION only adds this store; the existing three stores and their contents are untouched.
+  const SYNC_QUEUE_STORE='syncQueue';
   function dbOpen(){
     return new Promise((resolve,reject)=>{
       const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -2620,6 +2954,7 @@
         if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE,{keyPath:'id'});
         if(!db.objectStoreNames.contains(PROFILE_STORE)) db.createObjectStore(PROFILE_STORE,{keyPath:'id'});
         if(!db.objectStoreNames.contains(CONFIG_STORE)) db.createObjectStore(CONFIG_STORE,{keyPath:'id'});
+        if(!db.objectStoreNames.contains(SYNC_QUEUE_STORE)) db.createObjectStore(SYNC_QUEUE_STORE,{keyPath:'key'});
       };
       req.onsuccess = ()=>resolve(req.result);
       req.onerror = ()=>reject(req.error);
@@ -2662,6 +2997,28 @@
       tx.onerror = ()=>reject(tx.error);
     });
   }
+  // RELIABILITY: same put/delete as above but WITHOUT the scheduleCloudPush() side effect — used only
+  // for the sync-queue store itself, since queue bookkeeping (recording/clearing a retry) is not app
+  // data and must never trigger another cloud push (that would just re-queue itself). dbPut/dbDelete
+  // above are untouched; this is a new, separate pair of functions.
+  async function dbPutQuiet(record, storeName){
+    const db = await dbOpen();
+    return new Promise((resolve,reject)=>{
+      const tx = db.transaction(storeName,'readwrite');
+      tx.objectStore(storeName).put(record);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+  }
+  async function dbDeleteQuiet(key, storeName){
+    const db = await dbOpen();
+    return new Promise((resolve,reject)=>{
+      const tx = db.transaction(storeName,'readwrite');
+      tx.objectStore(storeName).delete(key);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+  }
   // FIX (log out then log back in / switching accounts is broken): IndexedDB here is one single local
   // cache shared by EVERY Supabase account that ever signs into this browser — nothing ever cleared it on
   // sign-out. So logging out and back in (same account or a different one) left whatever the PREVIOUS
@@ -2673,7 +3030,10 @@
   async function clearLocalData(){
     try{
       const db = await dbOpen();
-      await Promise.all([STORE, PROFILE_STORE, CONFIG_STORE].map(storeName=> new Promise((resolve,reject)=>{
+      // RELIABILITY: SYNC_QUEUE_STORE added here for the same reason the other three are cleared on
+      // sign-out (see comment above this function) — a queued retry belongs to the account that
+      // failed to sync, and must never be replayed against the next account that signs in.
+      await Promise.all([STORE, PROFILE_STORE, CONFIG_STORE, SYNC_QUEUE_STORE].map(storeName=> new Promise((resolve,reject)=>{
         const tx = db.transaction(storeName,'readwrite');
         tx.objectStore(storeName).clear();
         tx.oncomplete = ()=>resolve();
@@ -2965,6 +3325,8 @@
     merged.updatedAt = Date.now();
     await dbPut(merged, PROFILE_STORE);
     _profileCache = merged;
+    // Best-effort structured mirror of streak/XP/mastery — see pushProfileProgressToSql().
+    if(supabaseSession) pushProfileProgressToSql(merged);
     return merged;
   }
 
@@ -4092,7 +4454,16 @@
   function fmtTimer(ms){ const totalSec=Math.max(0,Math.floor(ms/1000)); const m=Math.floor(totalSec/60), s=totalSec%60; return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0'); }
   function fmtDate(ts){ const d=new Date(ts); return d.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}); }
   function normalize(w){ return w.toLowerCase().replace(/[^\p{L}\p{N}'\u2019-]/gu,''); }
-  function stripPunctKeepCase(w){ return w.replace(/[^\p{L}\p{N}'\u2019-]/gu,''); }
+  // Strips punctuation for grading, but keeps letters/numbers/hyphen and *internal* apostrophes so
+  // contractions/possessives (e.g. "isn't") still have to be typed correctly. A leading or trailing
+  // apostrophe/’ is treated as boundary punctuation instead — almost always it's a quotation mark
+  // closing a quoted phrase (e.g. "...singen Happy 'Birthday'." → the word is "Birthday", the trailing
+  // ' just closes the quote), not something the learner is expected to type. Without this, a correct
+  // answer like "Birthday" gets marked wrong against a source word of "Birthday'." purely because of
+  // the stray closing-quote character.
+  function stripPunctKeepCase(w){
+    return w.replace(/[^\p{L}\p{N}'\u2019-]/gu,'').replace(/^['\u2019]+|['\u2019]+$/gu,'');
+  }
   function foldUmlauts(w){ return w.toLowerCase().replace(/ä/g,'a').replace(/ö/g,'o').replace(/ü/g,'u').replace(/ß/g,'ss'); }
 
   // Number flexibility: "30" and "dreißig" (or any other German number word/digit spelling of the
@@ -4525,10 +4896,59 @@
     const topRow = document.querySelector('.top-row');
     if(topRow) topRow.style.display = (name==='login') ? 'none' : '';
   }
+  // Streak fix: leaving a story before its last sentence (Library/Home button) used to lose all of
+  // that session's practice time — finishExercise() was the ONLY place that ever built an "attempt"
+  // record (with timeMs), and it only ran once every sentence in the story had been checked. So 10
+  // minutes of real checked answers, followed by tapping Home instead of finishing the last sentence,
+  // counted as zero toward today's streak goal. This logs whatever was actually checked as its own
+  // attempt on the way out. If the story is later reopened and actually finished, that's a second,
+  // separate attempt for the same day — time only ever gets added, never lost or overwritten, which is
+  // the simplest tradeoff vs. trying to dedupe a partial attempt against a later full one.
+  async function logPartialAttemptIfNeeded(){
+    if(state.reviewMode) return; // review sentences already commit progress per-check; see commitReviewSentenceUpdate
+    if(state.finished) return; // finishExercise() already logged this session's attempt
+    if(!state.firstCheckCorrect || !state.firstCheckCorrect.some(v=> v!==null)) return; // nothing checked yet — nothing to log
+    timerPause();
+    const timeMs = state.timerElapsedMs;
+    if(timeMs<=0) return;
+    const attempted = state.firstCheckCorrect.filter(v=>v!==null).length;
+    const correctFirst = state.firstCheckCorrect.filter(v=>v===true).length;
+    let wc=0, wt=0;
+    state.wordStats.forEach(ws=>{ if(ws){ wc+=ws.correct; wt+=ws.total; } });
+    const config = await getConfig();
+    const mistakeCategories = emptyMistakeTally(config);
+    (state.categoryCounts||[]).forEach(c=>{ if(c) Object.keys(c).forEach(k=> mistakeCategories[k] = (mistakeCategories[k]||0)+(c[k]||0)); });
+    const charsTyped = computeCharsTyped(state.answers);
+    const typingSpeedWpm = computeTypingSpeedWpm(charsTyped, timeMs);
+    const wordAttempts = {};
+    (state.wordAttemptTally||[]).forEach(t=>{
+      if(!t) return;
+      Object.keys(t).forEach(w=>{
+        if(!wordAttempts[w]) wordAttempts[w] = {correct:0, total:0};
+        wordAttempts[w].correct += t[w].correct; wordAttempts[w].total += t[w].total;
+      });
+    });
+    const attempt = {
+      date:Date.now(), timeMs, wordsCorrect:wc, wordsTotal:wt, sentencesCorrect:correctFirst, sentencesTotal:attempted,
+      xpEarned:0, mistakeCategories, perfectSentences:correctFirst, typingSpeedWpm, wordAttempts,
+      replaysTotal: (state.playCounts||[]).reduce((s,n)=>s+(n||0), 0),
+      comboBonusXp: 0, longestComboThisSession: state.comboCount||0,
+      criticalMistakes: state.criticalMistakeCount||0, comboX5Hits: state.comboX5Hits||0, isPartial:true
+    };
+    const scores = computeWritingScores(attempt, config);
+    Object.assign(attempt, scores);
+    attempt.xpEarned = computeXpForAttempt(attempt, config);
+    state.attempts = state.attempts || [];
+    state.attempts.push(attempt);
+    try{ await syncProfileAfterAttempt(attempt); }catch(err){ console.error('partial attempt sync failed', err); }
+  }
   async function goHome(){
     clearTimeout(saveTimer);
     if(document.getElementById('screen-exercise').classList.contains('active')) timerPause();
-    if(state.currentExerciseId) await persistNow();
+    if(state.currentExerciseId){
+      await logPartialAttemptIfNeeded();
+      await persistNow();
+    }
     state.currentExerciseId = null;
     editSyncFromReadAlong = false; editSyncSnapshot = null; // in case Home was used to bail out of an Edit Sync session instead of Save/Cancel
     // Smart Review: per-sentence progress already committed durably as each was checked
@@ -4791,6 +5211,9 @@
       }
     });
     try{ await dbPut(rec); }catch(err){ console.error('save failed', err); }
+    // Best-effort structured mirror alongside the existing IndexedDB + blob save above (spec
+    // section 3). Not awaited — never delays or blocks the exercise screen on network/SQL latency.
+    if(supabaseSession) pushStoryProgressToSql(rec);
   }
 
   /* ================= timer ================= */
@@ -4812,6 +5235,13 @@
       timerResume(state.timerElapsedMs);
     }
   });
+  // RELIABILITY: the two triggers below are the recovery path for failures that happen while the tab
+  // stays open — neither depends on another unrelated save happening to fire scheduleCloudPush.
+  // 'online' covers the common case (phone/laptop loses and regains a connection mid-session); the
+  // interval catches anything whose exponential backoff (up to 10 minutes — see SYNC_RETRY_MAX_MS)
+  // elapses while the tab is just sitting open with nothing else triggering a save.
+  window.addEventListener('online', ()=>{ if(supabaseSession) processSyncQueue(); });
+  setInterval(()=>{ if(supabaseSession) processSyncQueue(); }, 60000);
   window.addEventListener('beforeunload', ()=>{
     if(document.getElementById('screen-exercise').classList.contains('active')){
       state.answers[state.currentIndex] = document.getElementById('answerInput').value;
@@ -5647,7 +6077,7 @@
       // saved progress says to resume — the whole point is landing on the exact sentence the learner was
       // just looking at in the other mode.
       const resumeIndex = finished ? 0 : Math.min(rec.progress.currentIndex||0, rec.sentences.length-1);
-      loadExerciseSentence(startIndex!=null ? Math.min(Math.max(0,startIndex), rec.sentences.length-1) : resumeIndex);
+      loadExerciseSentence(startIndex!=null ? Math.min(Math.max(0,startIndex), rec.sentences.length-1) : resumeIndex, {autoplay:true});
       initComboFromProfile();
       persistNow();
     }
@@ -8040,7 +8470,15 @@
     // on state.reviewBaseline), and — in Review Mode — swap in the correct story's audio, since the
     // queue can span many different stories, then update the "🧠 Smart Review · N of M" header.
     if(state.reviewBaseline && state.reviewBaseline[i]===undefined) state.reviewBaseline[i] = s.review || null;
-    if(state.reviewMode) ensureReviewAudioLoaded(i);
+    // Review Mode's queue can span many different stories, so the right story's audio has to be
+    // fetched (dbGet + resolveRecordAudioSrc) before it's safe to play — that's genuinely async, unlike
+    // Write mode where the audio is already loaded. Autoplay used to fire immediately after *starting*
+    // that fetch rather than after it finished, so audioEl still had the previous sentence's (or no)
+    // audio when play() ran — autoplay would silently do nothing or play the wrong clip, and felt like
+    // it "never" worked in Review Mode even though the exact same autoplay code path works fine in
+    // Write mode. Now autoplay waits for the fetch to resolve, and only fires if still on sentence i
+    // (the learner may have already clicked away by the time the fetch finishes).
+    const reviewAudioLoadPromise = state.reviewMode ? ensureReviewAudioLoaded(i) : null;
     updateReviewHeader();
     const isFreshSentence = !state.dotLocked[i];
     // Review Mode's self-grade panel replaces the typing answer box entirely — swap the UI, and never
@@ -8057,7 +8495,13 @@
     }
     if(selfGrade){ document.activeElement.blur && document.activeElement.blur(); } else { answerInput.focus(); }
     persistNow();
-    if(opts.autoplay && autoplayEnabled && isFreshSentence) playCurrentSentence();
+    if(opts.autoplay && autoplayEnabled && isFreshSentence){
+      if(reviewAudioLoadPromise){
+        reviewAudioLoadPromise.then(()=>{ if(state.currentIndex===i) playCurrentSentence(); });
+      } else {
+        playCurrentSentence();
+      }
+    }
   }
 
   function playCurrentSentence(){
@@ -8646,6 +9090,9 @@
         rec.updatedAt = Date.now();
         await dbPut(rec);
         invalidateSmartReviewCache(); // section 17: this sentence's due/tier status just changed
+        // Smart Review: durable per-sentence save to SQL, alongside the IndexedDB write above.
+        // Best-effort — see pushSmartReviewRowsToSql; never blocks or throws into this flow.
+        pushSmartReviewRowToSql(meta.recordId, meta.sentenceIndex, rec.sentences[meta.sentenceIndex].id, updated);
       }
     }catch(err){ console.error('Smart Review: failed to save sentence progress', err); }
     // Part 6: handed back so the caller can show the plain-language "how'd that go" toast off the
@@ -8726,7 +9173,7 @@
     // day where the only practice was a review session, the streak update is skipped entirely (stuck
     // at whatever it last was, never advancing or resetting).
     goToScreen('exercise');
-    loadExerciseSentence(0);
+    loadExerciseSentence(0, {autoplay:true});
     initComboFromProfile();
   }
   // mode: 'typing' (default — listen, type, Check Answer, see diff, same as a normal session) or
@@ -8757,7 +9204,7 @@
     setupExerciseState();
     timerStartFresh(); // see matching comment in startWeakPracticeSession above — same fix, same bug.
     goToScreen('exercise');
-    loadExerciseSentence(0);
+    loadExerciseSentence(0, {autoplay:true});
     initComboFromProfile();
   }
   // Section 14: same reward pipeline as a normal session (XP/streak/goals/achievements, via the
@@ -8933,7 +9380,7 @@
     state.sentenceStats = new Array(state.sentences.length).fill(null);
     setupExerciseState();
     goToScreen('exercise');
-    loadExerciseSentence(0);
+    loadExerciseSentence(0, {autoplay:true});
     initComboFromProfile();
   }
   const btnPracticeWeakAgainEl = document.getElementById('btnPracticeWeakAgain');
@@ -9444,6 +9891,17 @@
     await persistNow();
     if(srEnabledForCommit && state.firstCheckCorrect.some((v,i)=> v!==null && state.reviewPerfSnapshots && state.reviewPerfSnapshots[i])){
       invalidateSmartReviewCache(); // section 17: at least one sentence's review record changed this session
+      // Smart Review: this path updates review records too (not just Review Mode), so push every
+      // sentence that changed this session to SQL in one batched upsert — same best-effort,
+      // never-blocks-the-session guarantee as commitReviewSentenceUpdate's single-row push.
+      const changedEntries = [];
+      state.firstCheckCorrect.forEach((v,i)=>{
+        if(v===null) return;
+        if(!(state.reviewPerfSnapshots && state.reviewPerfSnapshots[i])) return;
+        if(!state.sentences[i] || !state.sentences[i].review) return;
+        changedEntries.push({ storyId: state.currentExerciseId, sentenceIndex: i, sentenceId: state.sentences[i].id, review: state.sentences[i].review });
+      });
+      pushSmartReviewRowsToSql(changedEntries);
     }
     let syncResult = { bonusXp:0, newlyCompletedGoals:[], newlyReachedMilestones:[] };
     try{ syncResult = await syncProfileAfterAttempt(attempt); }catch(err){ console.error('profile sync failed', err); }
